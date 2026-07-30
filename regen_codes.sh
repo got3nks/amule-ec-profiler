@@ -2,22 +2,40 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Regenerate ec_codes.py from the EC code header.
 #
-# ECCodes.h is the hand-maintained master for the committed enum + name strings
-# (ECCodes.java is stale and must be ignored). Re-run this after adding an EC
-# opcode or tag so the profiler names it instead of printing OP_0x??.
+# ECCodes.h carries the enum + name strings (ECCodes.java is stale and must be
+# ignored). Re-run this after adding an EC opcode or tag so the profiler names
+# it instead of printing OP_0x?? / a bare tag number.
 #
-# Usage: ./regen_codes.sh [path/to/amule-src]
+# The header is GENERATED from src/libs/ec/abstracts/ECCodes.abstract and is no
+# longer committed, so it only exists once the tree has been configured/built.
+# Look in the usual build directories before giving up, and say which ones were
+# tried -- "not found" with no list sends you hunting for a file that is simply
+# not in git.
+#
+# Usage: ./regen_codes.sh [path/to/amule-src] [path/to/ECCodes.h]
 
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 src=${1:-$here/../../amule-src}
-header=$src/src/libs/ec/cpp/ECCodes.h
+header=${2:-}
+
+if [ -z "$header" ]; then
+	for d in build-release build build-macos; do
+		cand=$src/$d/src/libs/ec/cpp/ECCodes.h
+		if [ -f "$cand" ]; then
+			header=$cand
+			break
+		fi
+	done
+fi
 
 if [ ! -f "$header" ]; then
-	echo "ECCodes.h not found at: $header" >&2
-	echo "pass the amule source root as the first argument" >&2
+	echo "ECCodes.h not found. It is generated, not committed -- build the tree first." >&2
+	echo "looked under $src in: build-release/ build/ build-macos/" >&2
+	echo "or pass it explicitly: ./regen_codes.sh <amule-src> <path/to/ECCodes.h>" >&2
 	exit 1
 fi
+echo "reading $header"
 
 python3 - "$header" "$here/ec_codes.py" <<'PY'
 import re, sys

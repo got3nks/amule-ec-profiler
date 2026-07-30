@@ -1,8 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0-or-later
-#
-# Generated from aMule's src/libs/ec/cpp/ECCodes.h -- do not hand-edit.
-# aMule is Copyright (c) the aMule Team, GPL-2.0-or-later:
-#   https://github.com/amule-org/amule
+# Generated from src/libs/ec/cpp/ECCodes.h -- do not hand-edit.
 # Regenerate with tools/ec-profiler/regen_codes.sh after an EC code change.
 # ECCodes.h is the hand-maintained master (ECCodes.java is stale).
 
@@ -94,6 +90,7 @@ OPCODES = {
     0x005D: 'EC_OP_GET_SHARED_DIRS',
     0x005E: 'EC_OP_SET_SHARED_DIRS',
     0x005F: 'EC_OP_SEARCH_REQUEST_MORE',
+    0x0060: 'EC_OP_SEARCH_LIST',
 }
 
 TAGS = {
@@ -123,6 +120,11 @@ TAGS = {
     0x0017: 'EC_TAG_CAN_SHAREDDIRS_CONFIG',
     0x0018: 'EC_TAG_ED2K_CONNECTED_SINCE',
     0x0019: 'EC_TAG_KAD_CONNECTED_SINCE',
+    0x001A: 'EC_TAG_CAN_SEARCH_LIST',
+    0x001B: 'EC_TAG_CAN_AEAD',
+    0x001C: 'EC_TAG_AEAD_CIPHER',
+    0x001D: 'EC_TAG_AEAD_CLIENT_NONCE',
+    0x001E: 'EC_TAG_AEAD_SERVER_NONCE',
     0x0100: 'EC_TAG_CLIENT_NAME',
     0x0101: 'EC_TAG_CLIENT_VERSION',
     0x0102: 'EC_TAG_CLIENT_MOD',

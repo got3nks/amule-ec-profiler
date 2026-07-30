@@ -51,12 +51,12 @@ import time
 import zlib
 
 try:
-    from ec_codes import OPCODES, TAGS  # noqa: F401  (TAGS reserved for tag-level parsing)
+    from ec_codes import OPCODES, TAGS
 except ImportError:  # pragma: no cover - allow running from another cwd
     import sys
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from ec_codes import OPCODES, TAGS  # noqa: F401
+    from ec_codes import OPCODES, TAGS
 
 # --- EC constants, mirrored from src/libs/ec/cpp/ECCodes.h -----------------
 
@@ -79,6 +79,7 @@ EC_MAX_PACKET = 256 * 1024 * 1024
 
 RECENT_LEN = 200  # per-tick tail sent to the dashboard, which accumulates its own log
 RTT_SAMPLES = 2000  # per-opcode reservoir for percentiles
+TAG_ROWS_LIVE = 12  # per-opcode tag rows pushed to the dashboard each tick
 THROUGHPUT_SECONDS = 60  # sparkline window
 
 
@@ -201,41 +202,87 @@ def _read_count(buf, pos, utf8, large):
     return n, pos
 
 
-def walk_tags(buf, pos, utf8, large, found, depth=0):
-    """Walk one children list, recording {tagname: bytes} for string tags.
+def walk_tags(buf, pos, utf8, large, found, depth=0, sizes=None):
+    """Walk one children list. Returns (end_pos, ideal_len), or (None, 0).
 
-    Returns the position after the list, or None if the bytes don't parse.
-    Bounded depth: this is a diagnostic aid, not a validating parser.
+    `ideal_len` is what CECTag::GetTagLen would report for this list, which is
+    NOT the number of bytes the list occupies on the wire. GetTagLen sums
+    fixed-width field sizes -- sizeof(tagname)+sizeof(tagtype)+sizeof(taglen),
+    i.e. 7, plus 2 for a nested tag's child-count -- while the wire FSS-encodes
+    those same numbers into as little as one byte each when EC_FLAG_UTF8_NUMBERS
+    is set. The reader computes a tag's own data length as
+    `declared - GetTagLen(children)`, so the walk has to reproduce that
+    arithmetic rather than measure how far the cursor moved. Measuring the
+    cursor happens to work only for a flat tag list, which is why this went
+    unnoticed while the walk was used solely on the (flat) login packet.
+
+    When `sizes` is a dict it also accumulates {tagname: [count, self, incl]};
+    see the module docs on self vs inclusive bytes.
     """
     if depth > 8:
-        return None
+        return None, 0
     count, pos = _read_count(buf, pos, utf8, large)
     if count is None or count > 1 << 20:
-        return None
+        return None, 0
+    ideal = 0
     for _ in range(count):
+        tag_start = pos
         raw_name, pos = read_number(buf, pos, utf8, 2)
         if raw_name is None:
-            return None
+            return None, 0
         has_children = bool(raw_name & 0x01)
         name = raw_name >> 1
         dtype, pos = read_number(buf, pos, utf8, 1)
         if dtype is None:
-            return None
+            return None, 0
         declared, pos = read_number(buf, pos, utf8, 4)
         if declared is None:
-            return None
+            return None, 0
         after_header = pos
+        # Header width is not a constant: FSS encodes small numbers in one
+        # byte and larger ones in more, so measure it rather than assume.
+        header_len = after_header - tag_start
+        child_ideal = 0
+        nchildren = 0
+        count_len = 0
         if has_children:
-            pos = walk_tags(buf, pos, utf8, large, found, depth + 1)
+            # The children list opens with its own count field. Those bytes are
+            # part of this tag's wire span and belong to no child, so charge
+            # them here -- otherwise sum(self) comes up short by one count
+            # field per container and no longer reconstructs the body.
+            nchildren, after_count = _read_count(buf, pos, utf8, large)
+            count_len = after_count - pos
+            pos, child_ideal = walk_tags(buf, pos, utf8, large, found, depth + 1, sizes)
             if pos is None:
-                return None
-        data_len = declared - (pos - after_header)
+                return None, 0
+        # Mirrors CECTag::ReadFromSocket's guard: a declared length shorter
+        # than the children it just parsed is malformed, not a huge data run.
+        if declared < child_ideal:
+            return None, 0
+        data_len = declared - child_ideal
         if data_len < 0 or pos + data_len > len(buf):
-            return None
+            return None, 0
         if name not in found and dtype == EC_TAGTYPE_STRING:
             found[name] = bytes(buf[pos : pos + data_len])
+        if sizes is not None:
+            slot = sizes.get(name)
+            if slot is None:
+                slot = sizes[name] = [0, 0, 0]
+            slot[0] += 1
+            # self: this tag's own header, the child-count field it owns, and
+            # its own data -- but not its children's bytes. Summing self over
+            # every tag reconstructs the body exactly.
+            slot[1] += header_len + count_len + data_len
+            # inclusive: the tag's whole wire span, children included.
+            slot[2] += (pos + data_len) - tag_start
         pos += data_len
-    return pos
+        # What GetTagLen would charge for this tag inside its parent.
+        ideal += declared + 7
+        if has_children:
+            ideal += 2
+            if large and nchildren is not None and nchildren >= 0xFFFF:
+                ideal += 4
+    return pos, ideal
 
 
 def client_ident_from_login(body, flags):
@@ -279,10 +326,16 @@ EC_OP_AUTH_REQ = 0x02
 KEEP_BODY_MAX = 8192
 
 
-class Packet:
-    __slots__ = ("flags", "body_len", "wire_len", "opcode", "inflated_len", "t", "body")
+# Per-tag byte accounting is off by default: it walks every tag of every
+# packet, where the rest of the parser only reads the header and the opcode.
+# Enabled with --tag-detail.
+TAG_DETAIL = False
 
-    def __init__(self, flags, body_len, wire_len, opcode, inflated_len, t, body=None):
+
+class Packet:
+    __slots__ = ("flags", "body_len", "wire_len", "opcode", "inflated_len", "t", "body", "tags")
+
+    def __init__(self, flags, body_len, wire_len, opcode, inflated_len, t, body=None, tags=None):
         self.flags = flags
         self.body_len = body_len
         self.wire_len = wire_len  # header + body, i.e. what crossed the socket
@@ -290,6 +343,11 @@ class Packet:
         self.inflated_len = inflated_len  # logical size when ZLIB was used
         self.t = t
         self.body = body
+        # {tagname: [count, self_bytes, incl_bytes]} when --tag-detail is on.
+        # Computed at parse time, while the whole body is still in hand, so a
+        # response too big for KEEP_BODY_MAX is still accounted for -- which is
+        # exactly the case worth measuring.
+        self.tags = tags
 
 
 class Framer:
@@ -325,32 +383,54 @@ class Framer:
                 break  # wait for the rest
             body = bytes(self.buf[EC_HEADER_SIZE:total])
             del self.buf[:total]
-            opcode, inflated_len = self._parse_body(flags, body)
+            opcode, inflated_len, plain, after_op = self._parse_body(flags, body)
             keep = body if body_len <= KEEP_BODY_MAX else None
-            out.append(Packet(flags, body_len, total, opcode, inflated_len, time.monotonic(), keep))
+            tags = None
+            if TAG_DETAIL and plain is not None and after_op is not None:
+                tags = {}
+                end, _ideal = walk_tags(
+                    plain,
+                    after_op,
+                    bool(flags & EC_FLAG_UTF8_NUMBERS),
+                    bool(flags & EC_FLAG_LARGE_TAG_COUNT),
+                    {},
+                    sizes=tags,
+                )
+                if end is None:
+                    # Unparseable body: report nothing rather than a partial
+                    # tally that would silently under-count this opcode.
+                    tags = None
+            out.append(
+                Packet(flags, body_len, total, opcode, inflated_len, time.monotonic(), keep, tags)
+            )
         return out
 
     @staticmethod
     def _parse_body(flags, body):
-        """First number of the body is the opcode. Returns (opcode, inflated_len)."""
+        """First number of the body is the opcode.
+
+        Returns (opcode, inflated_len, plain_body, pos_after_opcode). The plain
+        body and offset are handed back so a caller wanting the tag tree can
+        walk it without inflating a second time.
+        """
         if flags & EC_FLAG_ZLIB:
             # Inflate just enough to read the opcode; the whole body is cheap
             # at these sizes and gives us the logical length for a ratio.
             try:
                 plain = zlib.decompress(body)
             except zlib.error:
-                return None, None
-            opcode, _ = read_number(plain, 0, bool(flags & EC_FLAG_UTF8_NUMBERS), 1)
-            return opcode, len(plain)
-        opcode, _ = read_number(body, 0, bool(flags & EC_FLAG_UTF8_NUMBERS), 1)
-        return opcode, None
+                return None, None, None, None
+            opcode, pos = read_number(plain, 0, bool(flags & EC_FLAG_UTF8_NUMBERS), 1)
+            return opcode, len(plain), plain, pos
+        opcode, pos = read_number(body, 0, bool(flags & EC_FLAG_UTF8_NUMBERS), 1)
+        return opcode, None, body, pos
 
 
 # --- statistics -----------------------------------------------------------
 
 
 class OpStat:
-    __slots__ = ("calls", "req_bytes", "resp_bytes", "rtts", "rtt_sum", "rtt_max")
+    __slots__ = ("calls", "req_bytes", "resp_bytes", "rtts", "rtt_sum", "rtt_max", "tags")
 
     def __init__(self):
         self.calls = 0
@@ -359,8 +439,12 @@ class OpStat:
         self.rtts = collections.deque(maxlen=RTT_SAMPLES)
         self.rtt_sum = 0.0
         self.rtt_max = 0.0
+        # Response-side per-tag totals, {tagname: [count, self, incl]}. The
+        # request side is a handful of bytes for every op that matters here;
+        # the answer is where the traffic is.
+        self.tags = {}
 
-    def add(self, req_bytes, resp_bytes, rtt):
+    def add(self, req_bytes, resp_bytes, rtt, resp_tags=None):
         self.calls += 1
         self.req_bytes += req_bytes
         self.resp_bytes += resp_bytes
@@ -368,6 +452,29 @@ class OpStat:
             self.rtts.append(rtt)
             self.rtt_sum += rtt
             self.rtt_max = max(self.rtt_max, rtt)
+        if resp_tags:
+            for name, (n, own, incl) in resp_tags.items():
+                slot = self.tags.get(name)
+                if slot is None:
+                    slot = self.tags[name] = [0, 0, 0]
+                slot[0] += n
+                slot[1] += own
+                slot[2] += incl
+
+    def tag_rows(self, limit=None):
+        """Per-tag totals, biggest self-bytes first."""
+        rows = [
+            {
+                "tag": TAGS.get(name, "0x%04X" % name),
+                "count": n,
+                "self_bytes": own,
+                "incl_bytes": incl,
+                "per_call": round(own / self.calls, 1) if self.calls else 0,
+            }
+            for name, (n, own, incl) in self.tags.items()
+        ]
+        rows.sort(key=lambda r: -r["self_bytes"])
+        return rows[:limit] if limit else rows
 
 
 def pct(sorted_vals, q):
@@ -403,6 +510,11 @@ class Stats:
         self.ops_inst = collections.defaultdict(OpStat)
         self.clients = {}
         self.recent = collections.deque(maxlen=RECENT_LEN)
+        # Per-call tag detail, keyed by the same seq the log rows carry.
+        # Fetched on demand (/call?seq=N) rather than pushed: at RECENT_LEN
+        # rows a tag map per row would dominate every SSE tick, and only
+        # the row someone actually clicks is ever wanted.
+        self.call_tags = collections.OrderedDict()
         self.c2s_bytes = self.s2c_bytes = 0
         self.c2s_pkts = self.s2c_pkts = 0
         self.pushes = 0  # server packets with no request outstanding
@@ -522,12 +634,21 @@ class Stats:
 
     def on_call(self, req, resp, rtt, cid):
         label = self._label(cid)
-        self.ops[(label, req.opcode)].add(req.wire_len, resp.wire_len, rtt)
-        self.ops_inst[(cid, req.opcode)].add(req.wire_len, resp.wire_len, rtt)
+        self.ops[(label, req.opcode)].add(req.wire_len, resp.wire_len, rtt, resp.tags)
+        self.ops_inst[(cid, req.opcode)].add(req.wire_len, resp.wire_len, rtt, resp.tags)
         c = self.clients.get(cid)
         if c:
             c["calls"] += 1
         self.seq += 1
+        if resp.tags:
+            # Keyed by the seq the log row below carries, so the dashboard can
+            # ask for exactly this call. Stored after the increment rather than
+            # predicting it -- the two must not drift.
+            one = OpStat()
+            one.add(req.wire_len, resp.wire_len, rtt, resp.tags)
+            self.call_tags[self.seq] = one.tag_rows()
+            while len(self.call_tags) > RECENT_LEN:
+                self.call_tags.popitem(last=False)
         self.recent.append(
             {
                 "seq": self.seq,
@@ -569,7 +690,7 @@ class Stats:
         self.desyncs.append({"where": label, "reason": reason, "ts": time.time()})
 
     # -- snapshot for the dashboard
-    def snapshot(self):
+    def snapshot(self, tag_limit=TAG_ROWS_LIVE):
         now = time.monotonic()
         def row(who, code, st):
             q = sorted(st.rtts)
@@ -587,6 +708,10 @@ class Stats:
                     "max_ms": round(st.rtt_max * 1000, 3),
                     "mean_ms": round((st.rtt_sum / len(q)) * 1000, 3) if q else 0,
                     "total_ms": round(st.rtt_sum * 1000, 1),
+                    # Top response tags by self-bytes. Bounded: this rides the
+                    # SSE tick, and a long tail of one-off tags would bloat
+                    # every push for no insight. The session report keeps all.
+                    "tags": st.tag_rows(tag_limit),
             }
 
         rows = [row(label, code, st) for (label, code), st in self.ops.items()]
@@ -640,7 +765,9 @@ class Stats:
     # -- end-of-session report
     def report(self):
         """Session summary: counters plus one row per opcode, busiest first."""
-        snap = self.snapshot()
+        # No tag cap in the written report -- the whole point of the file
+        # is to still have the long tail after the session ends.
+        snap = self.snapshot(tag_limit=None)
         snap.pop("throughput", None)
         snap.pop("recent", None)
         snap["ops"].sort(key=lambda r: (r["client"], -r["total_bytes"]))
@@ -891,6 +1018,20 @@ class Dashboard:
                     break
             if path.startswith("/events"):
                 await self._sse(writer)
+            elif path.startswith("/call"):
+                seq = None
+                if "?" in path:
+                    for kv in path.split("?", 1)[1].split("&"):
+                        k, _, v = kv.partition("=")
+                        if k == "seq" and v.isdigit():
+                            seq = int(v)
+                rows = self.stats.call_tags.get(seq) if seq is not None else None
+                payload = json.dumps(
+                    {"seq": seq, "tags": rows if rows is not None else []},
+                    separators=(",", ":"),
+                ).encode()
+                self._respond(writer, 200, "application/json", payload)
+                await writer.drain()
             elif path.startswith("/reset"):
                 self.stats.reset()
                 self._respond(writer, 200, "application/json", b'{"ok":true}')
@@ -995,7 +1136,16 @@ def main():
         help="where session reports are written (default ./reports)",
     )
     ap.add_argument("--no-report", action="store_true", help="print the summary but do not write files")
+    ap.add_argument(
+        "--tag-detail",
+        action="store_true",
+        help="account bytes per EC tag inside each response (walks every tag of "
+        "every packet, so it costs more than the default header-only parse)",
+    )
     args = ap.parse_args()
+
+    global TAG_DETAIL
+    TAG_DETAIL = args.tag_detail
 
     stats_holder = {}
     started = {"ok": False}

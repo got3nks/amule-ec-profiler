@@ -104,6 +104,23 @@ tbody tr:hover td { background: color-mix(in oklab, var(--ink) 4%, transparent);
 .push { color: var(--muted); font-style: italic; }
 .warn { color: var(--warn); }
 .empty { color: var(--muted); font-size: 12px; padding: 6px 0; }
+/* per-tag drill-down under an opcode row (--tag-detail) */
+#ops tbody tr.parent td.op { cursor: pointer; }
+#ops tbody tr.parent td.op::before {
+  content: "\25B8"; display: inline-block; width: 11px; color: var(--muted);
+  transition: transform .12s ease;
+}
+#ops tbody tr.parent.open td.op::before { transform: rotate(90deg); }
+#ops tbody tr.detail > td { padding: 0 0 8px 22px; background: color-mix(in oklab, var(--ink) 2%, transparent); }
+table.tags { width: auto; min-width: 460px; font-size: 12px; }
+table.tags th { color: var(--muted); font-weight: 500; text-align: right; padding: 3px 10px 3px 0; }
+table.tags th.l, table.tags td.l { text-align: left; }
+table.tags td { padding: 2px 10px 2px 0; text-align: right; white-space: nowrap; }
+table.tags td.l { color: var(--ink); }
+.tagnote { color: var(--muted); font-size: 11px; padding: 4px 0 2px; }
+#recent tbody tr.call { cursor: pointer; }
+#recent tbody tr.call.open td.op { font-weight: 600; }
+#recent tbody tr.calldetail > td { padding: 0 0 8px 22px; background: color-mix(in oklab, var(--ink) 2%, transparent); }
 .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }
 @media (max-width: 1000px) { .cols { grid-template-columns: 1fr; } }
 .pill { font-size: 11px; color: var(--muted); }
@@ -307,7 +324,7 @@ function renderLog() {
     (gaps ? ` <span class="warn">· ${gaps} gap(s): calls outran the 1 s tick</span>` : "");
   const tb = $("#recent tbody");
   if (!rows.length) { tb.innerHTML = `<tr><td colspan="6" class="empty">nothing yet — use the client</td></tr>`; return; }
-  tb.innerHTML = rows.map(r => `<tr>
+  tb.innerHTML = rows.map(r => `<tr class="${r.kind === "call" ? "call" : ""}${openCalls.has(r.seq) ? " open" : ""}" data-seq="${r.seq}">
       <td class="l">${clock(r.ts)}</td>
       <td class="l" title="${r.instance || ""}"><i class="dot" style="background:${callerColor(key(r))}"></i>${nickOf(key(r))}</td>
       <td class="l op">${r.kind === "push"
@@ -316,7 +333,34 @@ function renderLog() {
       <td>${r.req_bytes ? bstr(r.req_bytes) : "–"}</td>
       <td>${bstr(r.resp_bytes)}</td>
       <td>${ms(r.rtt_ms)}</td>
-    </tr>`).join("");
+    </tr>` + (openCalls.has(r.seq)
+      ? `<tr class="calldetail"><td colspan="6">${callDetail(r)}</td></tr>` : "")).join("");
+  tb.onclick = ev => {
+    const tr = ev.target.closest("tr.call");
+    if (!tr) return;
+    const seq = Number(tr.dataset.seq);
+    if (openCalls.has(seq)) { openCalls.delete(seq); renderLog(); return; }
+    openCalls.add(seq);
+    if (callTags.has(seq)) { renderLog(); return; }
+    renderLog();                                  // show "loading" immediately
+    fetch(`/call?seq=${seq}`).then(r => r.json()).then(j => {
+      callTags.set(seq, j.tags || []);
+      if (callTags.size > 400) callTags.delete(callTags.keys().next().value);
+      renderLog();
+    }).catch(() => { callTags.set(seq, []); renderLog(); });
+  };
+}
+
+// One call's tag breakdown. Shares tagRows' table so the per-call and
+// per-opcode views cannot drift; only the empty-state wording differs, since
+// here it can also mean the call has aged out of the server's window.
+function callDetail(r) {
+  const t = callTags.get(r.seq);
+  if (t === undefined) return `<div class="tagnote">loading…</div>`;
+  if (!t.length) {
+    return `<div class="tagnote">no tag detail for this call &mdash; either the profiler is running without --tag-detail, or this call has scrolled out of the retained window</div>`;
+  }
+  return tagRows({ tags: t, calls: 1 });
 }
 
 /* ---- tiles ---- */
@@ -453,6 +497,14 @@ function clientsTable(d) {
 
 /* ---- opcode table ---- */
 let sortKey = "resp_bytes", sortDesc = true;
+// Which opcodes have their tag breakdown open. Kept outside render() so it
+// survives the re-render every SSE tick.
+const openOps = new Set();
+// Log rows expanded to show their own tag breakdown, and the per-seq detail
+// fetched for them. The server keeps detail only for the most recent calls, so
+// an old row can legitimately come back empty.
+const openCalls = new Set();
+const callTags = new Map();
 document.querySelectorAll("#ops th[data-k]").forEach(th => {
   th.onclick = () => {
     const k = th.dataset.k;
@@ -460,6 +512,41 @@ document.querySelectorAll("#ops th[data-k]").forEach(th => {
     if (last) render(last);
   };
 });
+// Fold one caller's tag totals into the aggregated opcode row. Same tag can
+// come from several callers, so add rather than replace.
+function mergeTags(cur, r) {
+  if (!r.tags || !r.tags.length) return;
+  if (!cur.tags) cur.tags = [];
+  const by = new Map(cur.tags.map(t => [t.tag, t]));
+  for (const t of r.tags) {
+    const e = by.get(t.tag);
+    if (e) { e.count += t.count; e.self_bytes += t.self_bytes; e.incl_bytes += t.incl_bytes; }
+    else { const c = Object.assign({}, t); cur.tags.push(c); by.set(t.tag, c); }
+  }
+}
+
+// The tag table for one opcode. self vs inclusive is the whole point: summing
+// inclusive would double-count every container, so self is what tells you
+// where the bytes are, inclusive tells you what they hang under.
+function tagRows(r) {
+  const tags = (r.tags || []).slice().sort((a, b) => b.self_bytes - a.self_bytes);
+  if (!tags.length) {
+    return `<div class="tagnote">no tag detail &mdash; restart the profiler with --tag-detail</div>`;
+  }
+  const tot = tags.reduce((n, t) => n + t.self_bytes, 0) || 1;
+  return `<table class="tags"><thead><tr>
+      <th class="l">tag</th><th>count</th><th>per call</th>
+      <th>self</th><th>share</th><th>inclusive</th>
+    </tr></thead><tbody>` + tags.map(t => `<tr>
+      <td class="l">${t.tag}</td>
+      <td>${t.count.toLocaleString()}</td>
+      <td>${(t.count / Math.max(1, r.calls)).toFixed(1)}</td>
+      <td>${bstr(t.self_bytes)}</td>
+      <td>${(t.self_bytes / tot * 100).toFixed(1)}%</td>
+      <td>${t.incl_bytes === t.self_bytes ? "&mdash;" : bstr(t.incl_bytes)}</td>
+    </tr>`).join("") + `</tbody></table>`;
+}
+
 function opsTable(d) {
   // Sum the per-(caller, opcode) rows the server sends, honouring the filter.
   const agg = new Map();
@@ -467,7 +554,8 @@ function opsTable(d) {
   for (const r of src) {
     if (clientFilter && r.client !== clientFilter) continue;
     const cur = agg.get(r.op);
-    if (!cur) { agg.set(r.op, Object.assign({}, r)); continue; }
+    if (!cur) { agg.set(r.op, Object.assign({}, r, { tags: (r.tags || []).map(t => Object.assign({}, t)) })); continue; }
+    mergeTags(cur, r);
     cur.calls += r.calls; cur.req_bytes += r.req_bytes; cur.resp_bytes += r.resp_bytes;
     cur.total_bytes += r.total_bytes; cur.total_ms += r.total_ms;
     cur.p50_ms = Math.max(cur.p50_ms, r.p50_ms);   // worst-case across callers
@@ -487,7 +575,7 @@ function opsTable(d) {
   const peak = Math.max(1, ...rows.map(r => r.resp_bytes));
   const tb = $("#ops tbody");
   if (!rows.length) { tb.innerHTML = `<tr><td colspan="10" class="empty">no calls seen yet</td></tr>`; return; }
-  tb.innerHTML = rows.map(r => `<tr>
+  tb.innerHTML = rows.map(r => `<tr class="parent${openOps.has(r.op) ? " open" : ""}" data-op="${r.op}">
       <td class="l op">${r.op}</td>
       <td class="l"><span class="tag">${r.id}</span></td>
       <td>${r.calls.toLocaleString()}</td>
@@ -498,7 +586,15 @@ function opsTable(d) {
       <td>${ms(r.p99_ms)}</td>
       <td>${ms(r.max_ms)}</td>
       <td>${ms(r.total_ms)}</td>
-    </tr>`).join("");
+    </tr>` + (openOps.has(r.op)
+      ? `<tr class="detail"><td colspan="10">${tagRows(r)}</td></tr>` : "")).join("");
+  tb.onclick = ev => {
+    const tr = ev.target.closest("tr.parent");
+    if (!tr) return;
+    const op = tr.dataset.op;
+    if (openOps.has(op)) openOps.delete(op); else openOps.add(op);
+    if (last) render(last);
+  };
 }
 
 function flagsTable(d) {

@@ -22,6 +22,7 @@ import zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from ec_profiler import (  # noqa: E402
+    walk_tags,
     EC_FLAG_BASE,
     EC_FLAG_LARGE_TAG_COUNT,
     EC_FLAG_UTF8_NUMBERS,
@@ -165,6 +166,60 @@ st.on_call(req, rsp, 0.1, 1)
 check("calls after reset keep their caller", st._label(1) == "amulegui"
       and any(k[0] == "amulegui" for k in st.ops), sorted(str(k) for k in st.ops))
 check("post-reset call is counted", st.clients[1]["calls"] == 1)
+
+print()
+print("per-tag byte accounting")
+
+
+def mktag(name, dtype, data=b"", children=(), ):
+    """Build one tag the way CECTag::WriteTag does.
+
+    The subtle part, and the thing the walker has to mirror: the declared
+    length is NOT the wire size. CECTag::GetTagLen sums FIXED-width field
+    sizes (2+1+4 per child, plus 2 for a child's own count field) while the
+    body FSS-encodes those numbers into fewer bytes. Building the fixture
+    with wire sizes instead would let a cursor-measuring walker pass and a
+    correct one fail.
+    """
+    kids = b"".join(c[0] for c in children)
+    ideal = sum(c[1] + 7 + (2 if c[2] else 0) for c in children)
+    declared = len(data) + ideal
+    raw_name = (name << 1) | (1 if children else 0)
+    body = (wctomb(len(children)) + kids if children else b"") + data
+    wire = wctomb(raw_name) + wctomb(dtype) + wctomb(declared) + body
+    return wire, declared, bool(children)
+
+
+_leafA = mktag(0x0500, 3, b"\x00\x00\x00\x2a")
+_s1 = mktag(0x0700, 6, b"abc")
+_s2 = mktag(0x0700, 6, b"xyz")
+_cont = mktag(0x0600, 6, b"", (_s1, _s2))
+_deep = mktag(0x0800, 6, b"", (mktag(0x0900, 6, b"", (_s1, _s2)),))
+_body = wctomb(0x21) + wctomb(3) + _leafA[0] + _cont[0] + _deep[0]
+
+_sizes = {}
+_end, _ideal = walk_tags(_body, len(wctomb(0x21)), True, False, {}, sizes=_sizes)
+check("walks a nested body to the end", _end == len(_body), "%r of %d" % (_end, len(_body)))
+
+# The invariant that makes the numbers trustworthy: every byte of the body
+# after the opcode and the root tag count belongs to exactly one tag's self
+# total. Containers own their children's count field; children own themselves.
+_overhead = len(wctomb(0x21)) + len(wctomb(3))
+_self_total = sum(v[1] for v in _sizes.values())
+check("sum(self_bytes) reconstructs the body", _self_total == len(_body) - _overhead,
+      "self=%d body-overhead=%d" % (_self_total, len(_body) - _overhead))
+check("a container's inclusive exceeds its self", _sizes[0x0600][2] > _sizes[0x0600][1],
+      repr(_sizes.get(0x0600)))
+check("repeated tags accumulate", _sizes[0x0700][0] == 4, repr(_sizes.get(0x0700)))
+check("a leaf's self equals its inclusive", _sizes[0x0500][1] == _sizes[0x0500][2],
+      repr(_sizes.get(0x0500)))
+check("an unparseable body yields no partial tally",
+      walk_tags(_body[:len(_body) - 3], len(wctomb(0x21)), True, False, {}, sizes={})[0] is None)
+# A declared length shorter than the children already parsed is malformed; the
+# reader rejects it rather than wrapping the unsigned subtraction (CECTag guard).
+_bad = bytearray(_cont[0]); _bad[2] = 1
+check("rejects a declared length below its children",
+      walk_tags(wctomb(0x21) + wctomb(1) + bytes(_bad), 1, True, False, {}, sizes={})[0] is None)
 
 print()
 if FAILED:

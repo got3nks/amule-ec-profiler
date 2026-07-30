@@ -52,6 +52,7 @@ Options:
 | `--web-bind` | `127.0.0.1` | interface for the **dashboard** — deliberately independent of `--bind` |
 | `--report-dir` | `./reports` | where session reports land |
 | `--no-report` | off | print the summary but write no files |
+| `--tag-detail` | off | account bytes per EC tag inside each response (walks every tag of every packet) |
 
 ## What it shows
 
@@ -75,6 +76,30 @@ dashboard consumes, so sessions can be diffed.
 Multiple clients can use the proxy at once. Each connection gets its own framer
 pair and its own pending-request queue, so concurrent sessions cannot corrupt
 each other's request/response pairing; stats are attributed per caller.
+
+## Where the bytes go, per tag
+
+`--tag-detail` breaks each response down by EC tag. Click an opcode row for the
+totals across every call, or a row in the live log for that one call.
+
+Each tag gets two numbers, and the difference matters:
+
+- **self** — the tag's own header, the child-count field it owns, and its own
+  data, *excluding* children.
+- **inclusive** — its whole wire span, children included.
+
+The on-wire length field includes children, so summing inclusive double-counts
+every container. Sorting by self tells you where the bytes actually are;
+inclusive tells you what they hang under. Summing self across every tag
+reconstructs the body exactly (minus the opcode and the root tag count) — the
+selftest asserts this, because it is the property that makes the numbers
+trustworthy.
+
+One subtlety the walker has to honour: `CECTag::GetTagLen` computes the declared
+length from *fixed-width* field sizes, while the body FSS-encodes those same
+numbers into fewer bytes. A tag's own data length is therefore
+`declared - GetTagLen(children)`, not `declared - (bytes the cursor moved)`.
+The two only agree for a flat tag list.
 
 ## Callers name themselves
 
