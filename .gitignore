@@ -1,0 +1,7 @@
+# Session reports contain real peer addresses and ports from whatever you
+# profiled -- keep them local.
+reports/
+
+__pycache__/
+*.py[cod]
+.DS_Store

@@ -1,0 +1,553 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EC profiler</title>
+<style>
+:root {
+  color-scheme: light;
+  --plane:   #f9f9f7;
+  --surface: #fcfcfb;
+  --ink:     #0b0b0b;
+  --ink-2:   #52514e;
+  --muted:   #898781;
+  --grid:    #e1e0d9;
+  --axis:    #c3c2b7;
+  --border:  rgba(11,11,11,0.10);
+  --c2s:     #2a78d6;  /* categorical slot 1 */
+  --s2c:     #eb6834;  /* categorical slot 2 */
+  --warn:    #d03b3b;  /* status: critical */
+  --good:    #0ca30c;  /* status: good */
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --plane: #0d0d0d; --surface: #1a1a19; --ink: #fff; --ink-2: #c3c2b7;
+    --muted: #898781; --grid: #2c2c2a; --axis: #383835;
+    --border: rgba(255,255,255,0.10); --c2s: #3987e5; --s2c: #d95926;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --plane: #0d0d0d; --surface: #1a1a19; --ink: #fff; --ink-2: #c3c2b7;
+  --muted: #898781; --grid: #2c2c2a; --axis: #383835;
+  --border: rgba(255,255,255,0.10); --c2s: #3987e5; --s2c: #d95926;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 20px; background: var(--plane); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+h1 { font-size: 15px; font-weight: 600; margin: 0; }
+.sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+header { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-bottom: 16px; flex-wrap: wrap; }
+.controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+button, select {
+  font: inherit; font-size: 12px; color: var(--ink-2); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; cursor: pointer;
+}
+button:hover, select:hover { color: var(--ink); }
+button.active { color: var(--surface); background: var(--ink); border-color: var(--ink); }
+
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; }
+.card > h2 {
+  font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--muted); margin: 0 0 12px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+}
+.card > h2 .norm { text-transform: none; letter-spacing: 0; font-weight: 400; }
+
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr)); gap: 2px; }
+.tile { padding: 2px 14px 2px 0; }
+.tile .k { font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 5px; }
+.tile .v { font-size: 21px; font-weight: 600; letter-spacing: -.01em; margin-top: 1px; }
+.tile .u { font-size: 12px; font-weight: 400; color: var(--ink-2); margin-left: 2px; }
+.swatch { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+
+.chartwrap { position: relative; }
+svg { display: block; width: 100%; height: 132px; overflow: visible; }
+/* Axis labels are drawn as SVG <text>; give them the page font explicitly and
+   keep the box unscaled (see the viewBox note in chart()) so glyphs are never
+   stretched. */
+svg text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 10px; }
+.legend { display: flex; gap: 16px; font-size: 12px; color: var(--ink-2); margin-bottom: 8px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+#tip {
+  position: absolute; pointer-events: none; opacity: 0; background: var(--surface);
+  border: 1px solid var(--border); border-radius: 6px; padding: 6px 9px; font-size: 12px;
+  box-shadow: 0 2px 10px rgba(0,0,0,.14); white-space: nowrap; transition: opacity .08s;
+}
+#tip .r { display: flex; align-items: center; gap: 6px; }
+#tip b { font-variant-numeric: tabular-nums; font-weight: 600; }
+
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+th, td { text-align: right; padding: 5px 8px; white-space: nowrap; }
+th:first-child, td:first-child, th.l, td.l { text-align: left; }
+th { font-size: 11px; font-weight: 600; color: var(--muted); border-bottom: 1px solid var(--axis); user-select: none; }
+th[data-k] { cursor: pointer; }
+th[data-k]:hover { color: var(--ink); }
+th.on { color: var(--ink); }
+th.on::after { content: " \25BC"; font-size: 8px; }
+th.on.asc::after { content: " \25B2"; }
+td { border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; color: var(--ink-2); }
+td.op { color: var(--ink); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; }
+tbody tr:hover td { background: color-mix(in oklab, var(--ink) 4%, transparent); }
+.scroll { overflow-x: auto; }
+.logscroll { max-height: 460px; overflow: auto; }
+.bar { height: 3px; border-radius: 2px; background: var(--s2c); display: block; margin-top: 3px; }
+.tag {
+  display: inline-block; font-size: 10.5px; padding: 1px 6px; border-radius: 999px;
+  border: 1px solid var(--border); color: var(--ink-2); font-family: ui-monospace, Menlo, monospace;
+}
+.dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 5px; }
+.push { color: var(--muted); font-style: italic; }
+.warn { color: var(--warn); }
+.empty { color: var(--muted); font-size: 12px; padding: 6px 0; }
+.cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }
+@media (max-width: 1000px) { .cols { grid-template-columns: 1fr; } }
+.pill { font-size: 11px; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>EC profiler</h1>
+    <div class="sub" id="route">waiting for data…</div>
+  </div>
+  <div class="controls">
+    <select id="groupby" title="how to attribute calls">
+      <option value="client">group by client type</option>
+      <option value="instance">group by instance</option>
+    </select>
+    <select id="clientf" title="filter every panel by caller"><option value="">all callers</option></select>
+    <button id="theme">theme</button>
+    <button id="reset">reset stats</button>
+  </div>
+</header>
+
+<div class="card">
+  <h2>Totals <span class="norm" id="scope"></span></h2>
+  <div class="tiles" id="tiles"></div>
+</div>
+
+<div class="card">
+  <h2>Throughput, last 60 s <span class="norm">— all callers, wire bytes/s</span></h2>
+  <div class="legend">
+    <span><i class="swatch" style="background:var(--c2s)"></i>client → daemon</span>
+    <span><i class="swatch" style="background:var(--s2c)"></i>daemon → client</span>
+  </div>
+  <div class="chartwrap">
+    <svg id="chart" aria-label="Throughput per second"></svg>
+    <div id="tip"></div>
+  </div>
+</div>
+
+<div id="notes"></div>
+
+<div class="card">
+  <h2>Callers</h2>
+  <div class="scroll">
+    <table id="clients">
+      <thead><tr>
+        <th class="l">instance</th><th class="l">type</th><th class="l">version</th><th class="l">peer</th>
+        <th>calls</th><th>sent</th><th>received</th><th class="l">state</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Calls by opcode <span class="norm">— click a column to sort</span></h2>
+  <div class="scroll">
+    <table id="ops">
+      <thead><tr>
+        <th class="l" data-k="op">request opcode</th>
+        <th class="l" data-k="id">id</th>
+        <th data-k="calls">calls</th>
+        <th data-k="req_bytes">req bytes</th>
+        <th data-k="resp_bytes">resp bytes</th>
+        <th data-k="avg_resp">avg resp</th>
+        <th data-k="p50_ms">p50</th>
+        <th data-k="p99_ms">p99</th>
+        <th data-k="max_ms">max</th>
+        <th data-k="total_ms">total time</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <h2>
+    Live call log
+    <span class="norm" id="logcount"></span>
+    <span style="margin-left:auto; display:flex; gap:8px;">
+      <button id="pause">pause</button>
+      <button id="clearlog">clear</button>
+    </span>
+  </h2>
+  <div class="logscroll">
+    <table id="recent">
+      <thead><tr>
+        <th class="l">time</th><th class="l">caller</th><th class="l">request → response</th>
+        <th>req</th><th>resp</th><th>rtt</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Packet flags observed</h2>
+  <div class="scroll">
+    <table id="flags">
+      <thead><tr><th class="l">flags</th><th class="l">meaning</th><th>packets</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <div class="sub" id="zlibnote" style="margin-top:10px"></div>
+</div>
+
+<script>
+const META = /*__META__*/null;
+const $ = s => document.querySelector(s);
+
+const LOG_MAX = 3000;    // rows kept in memory
+const LOG_RENDER = 400;  // rows actually put in the DOM
+
+/* ---- formatting ---- */
+function bytes(n) {
+  if (!n) return ["0", "B"];
+  const u = ["B","KB","MB","GB","TB"];
+  const i = Math.min(u.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
+  const v = n / Math.pow(1024, i);
+  return [v >= 100 || i === 0 ? Math.round(v).toString() : v.toFixed(1), u[i]];
+}
+const bstr = n => { const [v,u] = bytes(n); return v + " " + u; };
+function ms(x) {
+  if (x === null || x === undefined) return "–";
+  if (x === 0) return "0";
+  if (x < 1) return x.toFixed(2) + " ms";
+  if (x < 1000) return x.toFixed(1) + " ms";
+  return (x / 1000).toFixed(2) + " s";
+}
+function dur(s) {
+  const h = Math.floor(s/3600), m = Math.floor(s%3600/60), sec = Math.floor(s%60);
+  return (h ? h + "h " : "") + (h || m ? m + "m " : "") + sec + "s";
+}
+const clock = ts => new Date(ts * 1000).toLocaleTimeString([], {hour12:false}) +
+  "." + String(Math.floor((ts % 1) * 1000)).padStart(3, "0");
+
+/* stable per-caller colour: identity follows the entity, not its rank */
+const CALLER_COLORS = ["var(--c2s)", "var(--s2c)", "#1baf7a", "#eda100", "#e87ba4", "#4a3aa7"];
+const callerOrder = [];
+function callerColor(name) {
+  let i = callerOrder.indexOf(name);
+  if (i < 0) { callerOrder.push(name); i = callerOrder.length - 1; }
+  return CALLER_COLORS[i % CALLER_COLORS.length];
+}
+
+/* ---- controls ---- */
+let paused = false, buffered = 0, clientFilter = "", groupBy = "client";
+
+/* Two amulegui of the same build are identical on the wire -- EC carries no
+   per-instance id -- so instances are keyed by peer source port. That is exact
+   but opaque, so let the user nickname them; kept in localStorage per port. */
+let nicks = {};
+try { nicks = JSON.parse(localStorage.getItem("ecprof.nicks") || "{}"); } catch (e) { nicks = {}; }
+const saveNicks = () => localStorage.setItem("ecprof.nicks", JSON.stringify(nicks));
+const nickOf = inst => nicks[inst] || inst;
+$("#theme").onclick = () => {
+  const cur = document.documentElement.getAttribute("data-theme");
+  const dark = cur ? cur === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  document.documentElement.setAttribute("data-theme", dark ? "light" : "dark");
+  if (last) render(last);
+};
+$("#reset").onclick = () => { fetch("/reset"); log.length = 0; maxSeq = 0; gaps = 0; };
+$("#pause").onclick = () => {
+  paused = !paused;
+  $("#pause").textContent = paused ? "resume" : "pause";
+  $("#pause").classList.toggle("active", paused);
+  if (!paused) { buffered = 0; renderLog(); }
+};
+$("#clearlog").onclick = () => { log.length = 0; renderLog(); };
+$("#clientf").onchange = e => { clientFilter = e.target.value; if (last) render(last); };
+$("#groupby").onchange = e => {
+  groupBy = e.target.value; clientFilter = "";
+  $("#clientf").dataset.sig = "";           // force the filter list to rebuild
+  if (last) render(last);
+};
+
+/* ---- accumulating log ---- */
+const log = [];       // newest first
+let maxSeq = 0, gaps = 0;
+function ingest(recent) {
+  // `recent` is the server's newest-first tail; take everything we have not
+  // seen and prepend it. A jump beyond the tail means the burst outran the
+  // 1 s tick, so record that rows were missed rather than pretending otherwise.
+  const fresh = recent.filter(r => r.seq > maxSeq);
+  if (!fresh.length) return;
+  const newMax = Math.max(...fresh.map(r => r.seq));
+  if (maxSeq && fresh.length === recent.length && newMax - maxSeq > recent.length) gaps++;
+  maxSeq = newMax;
+  fresh.sort((a, b) => b.seq - a.seq);
+  log.unshift(...fresh);
+  if (log.length > LOG_MAX) log.length = LOG_MAX;
+  if (paused) buffered += fresh.length;
+}
+
+function renderLog() {
+  const key = r => (groupBy === "instance" ? (r.instance || r.client) : r.client);
+  const rows = (clientFilter ? log.filter(r => key(r) === clientFilter) : log).slice(0, LOG_RENDER);
+  $("#logcount").innerHTML =
+    `— ${log.length.toLocaleString()} kept, showing ${rows.length.toLocaleString()}` +
+    (paused ? ` <span class="warn">· paused, ${buffered.toLocaleString()} buffered</span>` : "") +
+    (gaps ? ` <span class="warn">· ${gaps} gap(s): calls outran the 1 s tick</span>` : "");
+  const tb = $("#recent tbody");
+  if (!rows.length) { tb.innerHTML = `<tr><td colspan="6" class="empty">nothing yet — use the client</td></tr>`; return; }
+  tb.innerHTML = rows.map(r => `<tr>
+      <td class="l">${clock(r.ts)}</td>
+      <td class="l" title="${r.instance || ""}"><i class="dot" style="background:${callerColor(key(r))}"></i>${nickOf(key(r))}</td>
+      <td class="l op">${r.kind === "push"
+        ? `<span class="push">push ←</span> ${r.resp}`
+        : `${r.req} <span style="color:var(--muted)">→</span> ${r.resp}`}</td>
+      <td>${r.req_bytes ? bstr(r.req_bytes) : "–"}</td>
+      <td>${bstr(r.resp_bytes)}</td>
+      <td>${ms(r.rtt_ms)}</td>
+    </tr>`).join("");
+}
+
+/* ---- tiles ---- */
+function tiles(d) {
+  const t = d.totals;
+  let c2s = t.c2s_bytes, s2c = t.s2c_bytes, calls = t.calls, pkts = t.c2s_pkts + t.s2c_pkts;
+  if (clientFilter) {
+    const cs = d.clients.filter(c => (groupBy === "instance" ? c.instance : c.label) === clientFilter);
+    c2s = cs.reduce((a, c) => a + c.c2s_bytes, 0);
+    s2c = cs.reduce((a, c) => a + c.s2c_bytes, 0);
+    pkts = cs.reduce((a, c) => a + c.c2s_pkts + c.s2c_pkts, 0);
+    calls = cs.reduce((a, c) => a + c.calls, 0);
+  }
+  const item = (k, v, u, sw) => `<div class="tile">
+      <div class="k">${sw ? `<i class="swatch" style="background:${sw}"></i>` : ""}${k}</div>
+      <div class="v">${v}${u ? `<span class="u">${u}</span>` : ""}</div></div>`;
+  const [cv, cu] = bytes(c2s), [sv, su] = bytes(s2c);
+  const amp = c2s ? (s2c / c2s).toFixed(1) + "×" : "–";
+  $("#scope").textContent = clientFilter ? `— ${nickOf(clientFilter)} only`
+    : (groupBy === "instance" ? "— all instances" : "— all callers");
+  $("#tiles").innerHTML =
+    item("client → daemon", cv, " " + cu, "var(--c2s)") +
+    item("daemon → client", sv, " " + su, "var(--s2c)") +
+    item("amplification", amp, "") +
+    item("calls", calls.toLocaleString(), "") +
+    item("packets", pkts.toLocaleString(), "") +
+    item("rtt p50", ms(t.p50_ms).split(" ")[0], " " + (ms(t.p50_ms).split(" ")[1] || "")) +
+    item("rtt p99", ms(t.p99_ms).split(" ")[0], " " + (ms(t.p99_ms).split(" ")[1] || "")) +
+    item("connections", t.conns_open + " / " + t.conns_total, "") +
+    item("uptime", dur(d.uptime), "");
+}
+
+/* ---- throughput chart ---- */
+const H = 132, PAD_L = 46, PAD_R = 6, PAD_T = 8, PAD_B = 16;
+let W = 600;                     // replaced each draw by the measured width
+let chartSeries = null;
+function chart(d) {
+  // Draw in real pixels: viewBox == the element's CSS size, so there is no
+  // non-uniform scale to stretch text or stroke widths. (The previous fixed
+  // 600-wide viewBox with preserveAspectRatio="none" scaled x but not y.)
+  const box = $("#chart").getBoundingClientRect();
+  W = Math.max(240, Math.round(box.width) || 600);
+  $("#chart").setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const s = d.throughput, n = s.length;
+  const peak = Math.max(1, ...s.map(p => Math.max(p[0], p[1])));
+  const x = i => PAD_L + (W - PAD_L - PAD_R) * (n === 1 ? 0 : i / (n - 1));
+  const y = v => PAD_T + (H - PAD_T - PAD_B) * (1 - v / peak);
+  const path = idx => s.map((p, i) => (i ? "L" : "M") + x(i).toFixed(1) + " " + y(p[idx]).toFixed(1)).join(" ");
+  let g = "";
+  for (let k = 0; k <= 2; k++) {
+    const v = peak * k / 2, yy = y(v);
+    g += `<line x1="${PAD_L}" y1="${yy.toFixed(1)}" x2="${W - PAD_R}" y2="${yy.toFixed(1)}"
+            stroke="var(--grid)" stroke-width="1" shape-rendering="crispEdges"/>
+          <text x="${PAD_L - 7}" y="${(yy + 3.5).toFixed(1)}" text-anchor="end"
+            fill="var(--muted)">${k ? bstr(v) + "/s" : "0"}</text>`;
+  }
+  $("#chart").innerHTML = g +
+    `<line x1="${PAD_L}" y1="${H - PAD_B}" x2="${W - PAD_R}" y2="${H - PAD_B}"
+       stroke="var(--axis)" stroke-width="1" shape-rendering="crispEdges"/>
+     <text x="${PAD_L}" y="${H - 4}" fill="var(--muted)">−60 s</text>
+     <text x="${W - PAD_R}" y="${H - 4}" fill="var(--muted)" text-anchor="end">now</text>
+     <path d="${path(0)}" fill="none" stroke="var(--c2s)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+     <path d="${path(1)}" fill="none" stroke="var(--s2c)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+     <line id="cross" x1="0" y1="${PAD_T}" x2="0" y2="${H - PAD_B}" stroke="var(--axis)" stroke-width="1" opacity="0"/>
+     <circle id="d0" r="3.5" fill="var(--c2s)" stroke="var(--surface)" stroke-width="2" opacity="0"/>
+     <circle id="d1" r="3.5" fill="var(--s2c)" stroke="var(--surface)" stroke-width="2" opacity="0"/>`;
+  chartSeries = {s, n, x, y};
+}
+const svg = $("#chart"), tip = $("#tip");
+svg.addEventListener("pointermove", ev => {
+  if (!chartSeries) return;
+  const {s, n, x, y} = chartSeries, r = svg.getBoundingClientRect();
+  const vx = (ev.clientX - r.left) / r.width * W;
+  let best = 0, bd = Infinity;
+  for (let i = 0; i < n; i++) { const dd = Math.abs(x(i) - vx); if (dd < bd) { bd = dd; best = i; } }
+  const px = x(best), p = s[best], cr = svg.querySelector("#cross");
+  cr.setAttribute("x1", px); cr.setAttribute("x2", px); cr.setAttribute("opacity", "1");
+  [0,1].forEach(k => { const c = svg.querySelector("#d" + k);
+    c.setAttribute("cx", px); c.setAttribute("cy", y(p[k])); c.setAttribute("opacity", "1"); });
+  tip.innerHTML =
+    `<div style="color:var(--muted);margin-bottom:3px">${n - 1 - best === 0 ? "now" : "−" + (n - 1 - best) + " s"}</div>` +
+    `<div class="r"><i class="swatch" style="background:var(--c2s)"></i>c→d <b>${bstr(p[0])}</b></div>` +
+    `<div class="r"><i class="swatch" style="background:var(--s2c)"></i>d→c <b>${bstr(p[1])}</b></div>`;
+  tip.style.opacity = 1;
+  tip.style.left = Math.min(r.width - tip.offsetWidth - 4, Math.max(0, px / W * r.width + 10)) + "px";
+  tip.style.top = "4px";
+});
+svg.addEventListener("pointerleave", () => {
+  tip.style.opacity = 0;
+  ["#cross","#d0","#d1"].forEach(id => svg.querySelector(id)?.setAttribute("opacity", "0"));
+});
+
+/* ---- callers table ---- */
+function clientsTable(d) {
+  const tb = $("#clients tbody");
+  if (!d.clients.length) { tb.innerHTML = `<tr><td colspan="8" class="empty">no connections yet</td></tr>`; return; }
+  tb.innerHTML = d.clients.map(c => `<tr>
+      <td class="l"><i class="dot" style="background:${callerColor(groupBy === "instance" ? c.instance : c.label)}"></i>
+        <span class="rename" data-inst="${c.instance}" title="click to nickname this instance"
+          style="cursor:text; border-bottom:1px dotted var(--border)">${nickOf(c.instance)}</span></td>
+      <td class="l">${c.label}</td>
+      <td class="l"><span class="tag">${c.version || "—"}</span></td>
+      <td class="l op">${c.peer}</td>
+      <td>${c.calls.toLocaleString()}</td>
+      <td>${bstr(c.c2s_bytes)}</td>
+      <td>${bstr(c.s2c_bytes)}</td>
+      <td class="l">${c.open
+        ? `<span style="color:var(--good)">open</span>`
+        : `<span class="pill">closed</span>`}</td>
+    </tr>`).join("");
+
+  // Same-version instances are indistinguishable on the wire, so let the user
+  // name them; the nickname is remembered per source port in localStorage.
+  tb.querySelectorAll(".rename").forEach(el => {
+    el.onclick = () => {
+      const inst = el.dataset.inst;
+      const v = prompt(`Nickname for ${inst}`, nicks[inst] || "");
+      if (v === null) return;
+      if (v.trim()) nicks[inst] = v.trim(); else delete nicks[inst];
+      saveNicks();
+      if (last) render(last);
+    };
+  });
+
+  const opts = groupBy === "instance" ? (d.instances || []) : d.labels;
+  const sel = $("#clientf"), want = ["", ...opts].join("|");
+  if (sel.dataset.sig !== want) {
+    sel.dataset.sig = want;
+    sel.innerHTML = `<option value="">all ${groupBy === "instance" ? "instances" : "callers"}</option>` +
+      opts.map(l => `<option value="${l}">${nickOf(l)}</option>`).join("");
+    sel.value = clientFilter;
+  }
+}
+
+/* ---- opcode table ---- */
+let sortKey = "resp_bytes", sortDesc = true;
+document.querySelectorAll("#ops th[data-k]").forEach(th => {
+  th.onclick = () => {
+    const k = th.dataset.k;
+    if (sortKey === k) sortDesc = !sortDesc; else { sortKey = k; sortDesc = true; }
+    if (last) render(last);
+  };
+});
+function opsTable(d) {
+  // Sum the per-(caller, opcode) rows the server sends, honouring the filter.
+  const agg = new Map();
+  const src = groupBy === "instance" ? (d.ops_inst || []) : d.ops;
+  for (const r of src) {
+    if (clientFilter && r.client !== clientFilter) continue;
+    const cur = agg.get(r.op);
+    if (!cur) { agg.set(r.op, Object.assign({}, r)); continue; }
+    cur.calls += r.calls; cur.req_bytes += r.req_bytes; cur.resp_bytes += r.resp_bytes;
+    cur.total_bytes += r.total_bytes; cur.total_ms += r.total_ms;
+    cur.p50_ms = Math.max(cur.p50_ms, r.p50_ms);   // worst-case across callers
+    cur.p99_ms = Math.max(cur.p99_ms, r.p99_ms);
+    cur.max_ms = Math.max(cur.max_ms, r.max_ms);
+    cur.avg_resp = Math.round(cur.resp_bytes / cur.calls);
+  }
+  const rows = [...agg.values()].sort((a, b) => {
+    const va = a[sortKey], vb = b[sortKey];
+    const c = typeof va === "string" ? va.localeCompare(vb) : va - vb;
+    return sortDesc ? -c : c;
+  });
+  document.querySelectorAll("#ops th[data-k]").forEach(th => {
+    th.classList.toggle("on", th.dataset.k === sortKey);
+    th.classList.toggle("asc", th.dataset.k === sortKey && !sortDesc);
+  });
+  const peak = Math.max(1, ...rows.map(r => r.resp_bytes));
+  const tb = $("#ops tbody");
+  if (!rows.length) { tb.innerHTML = `<tr><td colspan="10" class="empty">no calls seen yet</td></tr>`; return; }
+  tb.innerHTML = rows.map(r => `<tr>
+      <td class="l op">${r.op}</td>
+      <td class="l"><span class="tag">${r.id}</span></td>
+      <td>${r.calls.toLocaleString()}</td>
+      <td>${bstr(r.req_bytes)}</td>
+      <td>${bstr(r.resp_bytes)}<span class="bar" style="width:${(r.resp_bytes / peak * 100).toFixed(1)}%"></span></td>
+      <td>${bstr(r.avg_resp)}</td>
+      <td>${ms(r.p50_ms)}</td>
+      <td>${ms(r.p99_ms)}</td>
+      <td>${ms(r.max_ms)}</td>
+      <td>${ms(r.total_ms)}</td>
+    </tr>`).join("");
+}
+
+function flagsTable(d) {
+  $("#flags tbody").innerHTML = d.flags_seen.length
+    ? d.flags_seen.map(f => `<tr><td class="l op">${f.flags}</td><td class="l op">${f.names}</td>
+        <td>${f.packets.toLocaleString()}</td></tr>`).join("")
+    : `<tr><td colspan="3" class="empty">no packets yet</td></tr>`;
+  const z = d.zlib;
+  $("#zlibnote").textContent = z.packets
+    ? `${z.packets.toLocaleString()} packet(s) deflated — ${bstr(z.wire)} on the wire for ${bstr(z.logical)} logical (${z.ratio}×). Sizes are wire bytes.`
+    : "Nothing deflated: the client sent EC_TAG_PREFER_NO_ZLIB (loopback/LAN), so numbers are FSS-UTF encoded instead. Sizes are wire bytes.";
+}
+
+function notes(d) {
+  const out = [];
+  if (d.totals.pushes) out.push(`<span class="warn">${d.totals.pushes} unsolicited daemon packet(s)</span> — a client
+    advertised EC_TAG_CAN_NOTIFY, so pairing is approximate; these are excluded from rtt.`);
+  if (d.pruned_instances) out.push(`per-instance detail was dropped for
+    ${d.pruned_instances} older closed connection(s) to bound memory — their calls are still
+    counted under "group by client type".`);
+  d.desyncs.forEach(x => out.push(`<span class="warn">parser desync</span> on ${x.where}: ${x.reason}.
+    Byte forwarding is unaffected; stats for that direction stopped.`));
+  $("#notes").innerHTML = out.length
+    ? `<div class="card"><h2>Notes</h2>${out.map(o => `<div class="sub" style="margin-bottom:6px">${o}</div>`).join("")}</div>`
+    : "";
+}
+
+/* ---- wire up ---- */
+let last = null;
+function render(d) {
+  last = d;
+  tiles(d); chart(d); notes(d); clientsTable(d); opsTable(d);
+  if (!paused) renderLog(); else $("#logcount").innerHTML =
+    `— ${log.length.toLocaleString()} kept <span class="warn">· paused, ${buffered.toLocaleString()} buffered</span>`;
+}
+
+// Keep the pixel-accurate viewBox in step with the element width.
+if (window.ResizeObserver) {
+  let w0 = 0;
+  new ResizeObserver(() => {
+    const w = Math.round($("#chart").getBoundingClientRect().width);
+    if (w && w !== w0) { w0 = w; if (last) chart(last); }
+  }).observe($("#chart"));
+}
+
+if (META) $("#route").textContent = `client → 127.0.0.1:${META.listen} → ${META.target}`;
+const es = new EventSource("/events");
+es.onmessage = e => { const d = JSON.parse(e.data); ingest(d.recent); render(d); };
+es.onerror = () => { $("#route").textContent = "disconnected — is ec_profiler.py still running?"; };
+</script>
+</body>
+</html>
