@@ -192,6 +192,24 @@ rather than breaking anything, so regenerating is optional.
 
 ## Caveats worth knowing
 
+**An encrypted EC session is opaque to the profiler — turn encryption off, or
+you are measuring ciphertext.** Since AEAD landed, clients negotiate an
+encrypted session by default whenever the daemon supports it, and everything
+after the login handshake becomes unreadable. Nothing crashes and no warning is
+printed: opcodes simply decode as `?` or nonsense like `OP_0x635`, packets are
+still sized correctly, and the per-tag breakdown comes back empty. It reads like
+a parser bug, and it is not.
+
+To profile a real session, disable encryption on the client:
+
+- **amuleGUI** — untick *Encryption* in the connection dialog, or set
+  `Encryption=0` under `[EC]` in its `remote.conf`.
+- **amuleapi / amulecmd** — pass `--disable-ec-encryption`.
+
+The login packets stay readable either way, which is why the client still names
+itself correctly while everything after it is noise. If most opcodes show as `?`
+and the tag columns are empty, check this first.
+
 **The proxy can change what it measures, on non-loopback setups.** The no-zlib
 decision is made by the *client*, from the address it dialed
 (`m_preferNoZlib = IsLoopbackIP(resolved_ip) || IsLanIP(...)`). A **remote**
