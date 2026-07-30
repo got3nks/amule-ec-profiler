@@ -1,5 +1,7 @@
 # amule-ec-profiler
 
+<img width="1847" height="1289" alt="immagine" src="https://github.com/user-attachments/assets/674f8255-015b-4c33-84af-60c0e752b421" />
+
 A pass-through TCP proxy that sits between an [aMule](https://github.com/amule-org/amule)
 External Connect (EC) client and `amuled`, and reports what the link actually
 costs — bytes per opcode, calls per caller, round-trip times — with a live
